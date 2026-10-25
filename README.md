@@ -6,7 +6,7 @@
 
 ## 当前进度
 
-输入可以是 stdin 或一个文件；输出仍是 stdout。只搬原始字节。
+输入/输出都可以是标准流或文件；`-` 表示 stdin / stdout。只搬原始字节。
 
 ## 编译
 
@@ -19,6 +19,8 @@ cc -Wall -Wextra -O0 -g -o relay src/main.c
 ```text
 echo 'hello' | ./relay
 ./relay some.bin
+./relay some.bin out.bin
+echo 'hello' | ./relay - out.bin
 ./relay some.bin | xxd
 ```
 
