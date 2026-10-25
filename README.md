@@ -6,7 +6,7 @@
 
 ## 当前进度
 
-stdin → stdout 原始字节拷贝（最小中继形态）。
+输入可以是 stdin 或一个文件；输出仍是 stdout。只搬原始字节。
 
 ## 编译
 
@@ -18,7 +18,8 @@ cc -Wall -Wextra -O0 -g -o relay src/main.c
 
 ```text
 echo 'hello' | ./relay
-printf '\x01\x02\x03' | ./relay | xxd
+./relay some.bin
+./relay some.bin | xxd
 ```
 
 无协议解析：读到什么字节就写出什么字节。

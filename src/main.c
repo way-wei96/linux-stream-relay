@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -44,9 +45,48 @@ static int relay_bytes(int in_fd, int out_fd)
     }
 }
 
-int main(void)
+/*
+ * 决定从哪读：path == NULL 用 stdin，否则 open 文件。
+ * 成功返回 fd；失败返回 -1。
+ * 调用方：若返回值不是 STDIN_FILENO，用完需 close。
+ */
+static int open_input(const char *path)
 {
-    if (relay_bytes(STDIN_FILENO, STDOUT_FILENO) < 0)
+    int fd;
+
+    if (path == NULL)
+        return STDIN_FILENO;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return -1;
+    }
+    return fd;
+}
+
+int main(int argc, char **argv)
+{
+    const char *path = NULL;
+    int in_fd;
+    int status = 0;
+
+    if (argc > 2) {
+        fprintf(stderr, "usage: %s [infile]\n", argv[0]);
         return 1;
-    return 0;
+    }
+    if (argc == 2)
+        path = argv[1];
+
+    in_fd = open_input(path);
+    if (in_fd < 0)
+        return 1;
+
+    if (relay_bytes(in_fd, STDOUT_FILENO) < 0)
+        status = 1;
+
+    if (in_fd != STDIN_FILENO)
+        close(in_fd);
+
+    return status;
 }
