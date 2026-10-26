@@ -1,8 +1,21 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+/* 把 fd 设成非阻塞。成功 0，失败 -1。 */
+static int set_nonblock(int fd)
+{
+    int flags = fcntl(fd, F_GETFL);
+
+    if (flags < 0)
+        return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+    return 0;
+}
 
 /* 把 buf 里 n 字节写完；短写则继续。成功 0，失败 -1。 */
 static int write_all(int fd, const unsigned char *buf, ssize_t n)
@@ -22,13 +35,35 @@ static int write_all(int fd, const unsigned char *buf, ssize_t n)
     return 0;
 }
 
-/* 原始字节中继：in_fd → out_fd，直到 EOF。成功 0，失败 -1。 */
+/*
+ * 原始字节中继：in_fd → out_fd，直到 EOF。成功 0，失败 -1。
+ * 输入侧：非阻塞 + poll 等可读；输出侧：仍阻塞写完。
+ */
 static int relay_bytes(int in_fd, int out_fd)
 {
     unsigned char buf[256];
+    struct pollfd pfd;
     ssize_t n;
 
+    pfd.fd = in_fd;
+    pfd.events = POLLIN;
+
     for (;;) {
+        pfd.revents = 0;
+        if (poll(&pfd, 1, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("poll");
+            return -1;
+        }
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            fprintf(stderr, "poll: input error\n");
+            return -1;
+        }
+        /* POLLIN 有数据；POLLHUP 对端关了——都先尝试 read */
+        if (!(pfd.revents & (POLLIN | POLLHUP)))
+            continue;
+
         n = read(in_fd, buf, sizeof buf);
         if (n > 0) {
             if (write_all(out_fd, buf, n) < 0) {
@@ -39,7 +74,7 @@ static int relay_bytes(int in_fd, int out_fd)
         }
         if (n == 0)
             return 0; /* EOF */
-        if (errno == EINTR)
+        if (errno == EINTR || errno == EAGAIN)
             continue;
         perror("read");
         return -1;
@@ -114,8 +149,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (relay_bytes(in_fd, out_fd) < 0)
+    if (set_nonblock(in_fd) < 0) {
+        perror("fcntl");
         status = 1;
+    } else if (relay_bytes(in_fd, out_fd) < 0) {
+        status = 1;
+    }
 
     if (in_fd != STDIN_FILENO)
         close(in_fd);
