@@ -17,6 +17,13 @@ static int set_nonblock(int fd)
     return 0;
 }
 
+/* 若 fd 不是标准流，则 close。 */
+static void close_if_opened(int fd, int std_fd)
+{
+    if (fd != std_fd)
+        close(fd);
+}
+
 /* 把 buf 里 n 字节写完；短写则继续。成功 0，失败 -1。 */
 static int write_all(int fd, const unsigned char *buf, ssize_t n)
 {
@@ -35,15 +42,10 @@ static int write_all(int fd, const unsigned char *buf, ssize_t n)
     return 0;
 }
 
-/*
- * 原始字节中继：in_fd → out_fd，直到 EOF。成功 0，失败 -1。
- * 输入侧：非阻塞 + poll 等可读；输出侧：仍阻塞写完。
- */
-static int relay_bytes(int in_fd, int out_fd)
+/* 等到 in_fd 可读（或对端挂起）。成功 0，失败 -1。 */
+static int wait_readable(int in_fd)
 {
-    unsigned char buf[256];
     struct pollfd pfd;
-    ssize_t n;
 
     pfd.fd = in_fd;
     pfd.events = POLLIN;
@@ -60,9 +62,24 @@ static int relay_bytes(int in_fd, int out_fd)
             fprintf(stderr, "poll: input error\n");
             return -1;
         }
-        /* POLLIN 有数据；POLLHUP 对端关了——都先尝试 read */
-        if (!(pfd.revents & (POLLIN | POLLHUP)))
-            continue;
+        /* POLLIN 有数据；POLLHUP 对端关了——都算可以去 read */
+        if (pfd.revents & (POLLIN | POLLHUP))
+            return 0;
+    }
+}
+
+/*
+ * 原始字节中继：in_fd → out_fd，直到 EOF。成功 0，失败 -1。
+ * 输入侧：非阻塞 + poll 等可读；输出侧：仍阻塞写完。
+ */
+static int relay_bytes(int in_fd, int out_fd)
+{
+    unsigned char buf[256];
+    ssize_t n;
+
+    for (;;) {
+        if (wait_readable(in_fd) < 0)
+            return -1;
 
         n = read(in_fd, buf, sizeof buf);
         if (n > 0) {
@@ -121,22 +138,34 @@ static int open_output(const char *path)
     return fd;
 }
 
+/* 解析 [infile [outfile]]。成功 0，用法错 -1。 */
+static int parse_args(int argc, char **argv,
+                      const char **in_path, const char **out_path)
+{
+    *in_path = NULL;
+    *out_path = NULL;
+
+    if (argc > 3) {
+        fprintf(stderr, "usage: %s [infile [outfile]]\n", argv[0]);
+        return -1;
+    }
+    if (argc >= 2)
+        *in_path = argv[1];
+    if (argc == 3)
+        *out_path = argv[2];
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
-    const char *in_path = NULL;
-    const char *out_path = NULL;
+    const char *in_path;
+    const char *out_path;
     int in_fd;
     int out_fd;
     int status = 0;
 
-    if (argc > 3) {
-        fprintf(stderr, "usage: %s [infile [outfile]]\n", argv[0]);
+    if (parse_args(argc, argv, &in_path, &out_path) < 0)
         return 1;
-    }
-    if (argc >= 2)
-        in_path = argv[1];
-    if (argc == 3)
-        out_path = argv[2];
 
     in_fd = open_input(in_path);
     if (in_fd < 0)
@@ -144,8 +173,7 @@ int main(int argc, char **argv)
 
     out_fd = open_output(out_path);
     if (out_fd < 0) {
-        if (in_fd != STDIN_FILENO)
-            close(in_fd);
+        close_if_opened(in_fd, STDIN_FILENO);
         return 1;
     }
 
@@ -156,10 +184,7 @@ int main(int argc, char **argv)
         status = 1;
     }
 
-    if (in_fd != STDIN_FILENO)
-        close(in_fd);
-    if (out_fd != STDOUT_FILENO)
-        close(out_fd);
-
+    close_if_opened(in_fd, STDIN_FILENO);
+    close_if_opened(out_fd, STDOUT_FILENO);
     return status;
 }
