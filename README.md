@@ -7,12 +7,13 @@
 ## 当前进度
 
 输入/输出都可以是标准流或文件；`-` 表示 stdin / stdout。
-输入侧非阻塞 + `poll` 等可读；输出仍阻塞写。只搬原始字节。
+两端非阻塞；`poll` 同时盯 `POLLIN` / `POLLOUT`，中间缓冲未写完的字节。只搬原始字节。
+源码已拆：`main.c`（入口）、`fdutil`（打开/非阻塞）、`relay`（中继核心）。
 
 ## 编译
 
 ```text
-cc -Wall -Wextra -O0 -g -o relay src/main.c
+cc -Wall -Wextra -O0 -g -o relay src/main.c src/fdutil.c src/relay.c
 ```
 
 ## 运行示例
