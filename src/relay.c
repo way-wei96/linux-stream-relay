@@ -1,162 +1,105 @@
 #include "relay.h"
 
-#include <errno.h>
-#include <poll.h>
+#include "poll_relay.h"
+
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
-struct relay_buf {
-    unsigned char data[256];
-    size_t len;
-    int in_done;
+/*
+ * 本半步练习用的共享状态：两线程都只通过 mutex 碰计数。
+ * 还没有 cond，也没有改 IO 模型。
+ */
+struct shared {
+    pthread_mutex_t mu;
+    unsigned long relay_loops; /* 中继线程：每轮 poll 循环 +1 */
+    unsigned long side_count;  /* 旁路线程：空转时 +1 */
 };
 
 struct relay_arg {
     int in_fd;
     int out_fd;
     int status;
+    struct shared *shared;
 };
 
-static int poll_add(struct pollfd *pfds, int nfd, int fd, short events)
+static void shared_inc_relay_loops(void *arg)
 {
-    pfds[nfd].fd = fd;
-    pfds[nfd].events = events;
-    pfds[nfd].revents = 0;
-    return nfd + 1;
+    struct shared *s = arg;
+
+    pthread_mutex_lock(&s->mu);
+    s->relay_loops++;
+    pthread_mutex_unlock(&s->mu);
 }
 
-static int poll_wait(struct pollfd *pfds, int nfd)
+static void shared_inc_side_count(struct shared *s)
 {
-    for (;;) {
-        if (poll(pfds, nfd, -1) < 0) {
-            if (errno == EINTR)
-                continue;
-            perror("poll");
-            return -1;
-        }
-        return 0;
-    }
+    pthread_mutex_lock(&s->mu);
+    s->side_count++;
+    pthread_mutex_unlock(&s->mu);
 }
 
-static int poll_has_error(short revents, const char *side)
-{
-    if (!(revents & (POLLERR | POLLNVAL)))
-        return 0;
-    fprintf(stderr, "poll: %s error\n", side);
-    return 1;
-}
-
-static int buf_read(int in_fd, struct relay_buf *b)
-{
-    ssize_t n = read(in_fd, b->data + b->len, sizeof b->data - b->len);
-
-    if (n > 0) {
-        b->len += (size_t)n;
-        return 0;
-    }
-    if (n == 0) {
-        b->in_done = 1;
-        return 0;
-    }
-    if (errno == EINTR || errno == EAGAIN)
-        return 0;
-    perror("read");
-    return -1;
-}
-
-static int buf_write(int out_fd, struct relay_buf *b)
-{
-    ssize_t w = write(out_fd, b->data, b->len);
-
-    if (w > 0) {
-        b->len -= (size_t)w;
-        if (b->len > 0)
-            memmove(b->data, b->data + w, b->len);
-        return 0;
-    }
-    if (w < 0 && (errno == EINTR || errno == EAGAIN))
-        return 0;
-    perror("write");
-    return -1;
-}
-
-static int handle_input(int in_fd, short revents, struct relay_buf *b)
-{
-    if (poll_has_error(revents, "input"))
-        return -1;
-    if (!(revents & (POLLIN | POLLHUP)))
-        return 0;
-    return buf_read(in_fd, b);
-}
-
-static int handle_output(int out_fd, short revents, struct relay_buf *b)
-{
-    if (poll_has_error(revents, "output"))
-        return -1;
-    if (!(revents & POLLOUT))
-        return 0;
-    return buf_write(out_fd, b);
-}
-
-/* 原来的单线程 poll 中继。 */
-static int relay_poll(int in_fd, int out_fd)
-{
-    struct relay_buf b = {0};
-    struct pollfd pfds[2];
-
-    for (;;) {
-        int nfd = 0;
-        int in_idx = -1;
-        int out_idx = -1;
-
-        if (b.in_done && b.len == 0)
-            return 0;
-
-        if (!b.in_done && b.len < sizeof b.data) {
-            in_idx = nfd;
-            nfd = poll_add(pfds, nfd, in_fd, POLLIN);
-        }
-        if (b.len > 0) {
-            out_idx = nfd;
-            nfd = poll_add(pfds, nfd, out_fd, POLLOUT);
-        }
-
-        if (poll_wait(pfds, nfd) < 0)
-            return -1;
-        if (in_idx >= 0 && handle_input(in_fd, pfds[in_idx].revents, &b) < 0)
-            return -1;
-        if (out_idx >= 0 && handle_output(out_fd, pfds[out_idx].revents, &b) < 0)
-            return -1;
-    }
-}
-
-/* 丢进线程里跑的任务：做原来的 poll 中继。 */
 static void *relay_task(void *arg)
 {
     struct relay_arg *a = arg;
 
-    a->status = relay_poll(a->in_fd, a->out_fd);
+    a->status = poll_relay(a->in_fd, a->out_fd,
+                           shared_inc_relay_loops, a->shared);
+    return NULL;
+}
+
+/* 旁路任务：反复在同一把锁上给 side_count +1，不碰 IO。 */
+static void *side_task(void *arg)
+{
+    struct shared *s = arg;
+    int i;
+
+    for (i = 0; i < 10000; i++)
+        shared_inc_side_count(s);
     return NULL;
 }
 
 int relay_bytes(int in_fd, int out_fd)
 {
+    struct shared shared;
     struct relay_arg arg;
-    pthread_t tid;
+    pthread_t relay_tid;
+    pthread_t side_tid;
+    int have_relay = 0;
+    int have_side = 0;
+    int status = -1;
+
+    memset(&shared, 0, sizeof shared);
+    pthread_mutex_init(&shared.mu, NULL);
 
     arg.in_fd = in_fd;
     arg.out_fd = out_fd;
     arg.status = -1;
+    arg.shared = &shared;
 
-    if (pthread_create(&tid, NULL, relay_task, &arg) != 0) {
+    if (pthread_create(&relay_tid, NULL, relay_task, &arg) != 0) {
         perror("pthread_create");
-        return -1;
+        goto cleanup;
     }
-    if (pthread_join(tid, NULL) != 0) {
-        perror("pthread_join");
-        return -1;
+    have_relay = 1;
+
+    if (pthread_create(&side_tid, NULL, side_task, &shared) != 0) {
+        perror("pthread_create");
+        goto cleanup;
     }
-    return arg.status;
+    have_side = 1;
+    goto cleanup;
+
+cleanup:
+    if (have_relay)
+        pthread_join(relay_tid, NULL);
+    if (have_side)
+        pthread_join(side_tid, NULL);
+    if (have_relay && have_side)
+        status = arg.status;
+
+    (void)shared.relay_loops;
+    (void)shared.side_count;
+    pthread_mutex_destroy(&shared.mu);
+    return status;
 }

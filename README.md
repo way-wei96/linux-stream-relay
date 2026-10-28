@@ -7,13 +7,14 @@
 ## 当前进度
 
 输入/输出都可以是标准流或文件；`-` 表示 stdin / stdout。
-中继仍是非阻塞 + `poll`；pthread 半步只练：工作线程里跑中继，`main` 负责 `create`/`join`。
-源码：`main.c`（入口）、`fdutil`（打开/非阻塞）、`relay`（poll 中继 + 线程壳）。
+中继仍是非阻塞 + `poll`（工作线程里跑）。
+pthread：另有旁路线程；两线程用同一把 `mutex` 改计数，只练 `lock`/`unlock`（尚无 cond）。
+源码：`main.c`（入口）、`fdutil`（打开/非阻塞）、`poll_relay`（poll 中继）、`relay`（线程 + mutex 练习）。
 
 ## 编译
 
 ```text
-cc -Wall -Wextra -O0 -g -pthread -o relay src/main.c src/fdutil.c src/relay.c
+cc -Wall -Wextra -O0 -g -pthread -o relay src/main.c src/fdutil.c src/poll_relay.c src/relay.c
 ```
 
 ## 运行示例
