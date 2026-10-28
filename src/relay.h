@@ -4,6 +4,7 @@
 /*
  * 原始字节中继：直到输入 EOF 且缓冲写完。成功 0，失败 -1。
  * 调用方需先把两端设成非阻塞。
+ * 当前半步：在工作线程里跑 poll 中继，main 只负责 create/join。
  */
 int relay_bytes(int in_fd, int out_fd);
 

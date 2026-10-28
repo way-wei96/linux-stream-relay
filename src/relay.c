@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -10,6 +11,12 @@ struct relay_buf {
     unsigned char data[256];
     size_t len;
     int in_done;
+};
+
+struct relay_arg {
+    int in_fd;
+    int out_fd;
+    int status;
 };
 
 static int poll_add(struct pollfd *pfds, int nfd, int fd, short events)
@@ -93,7 +100,8 @@ static int handle_output(int out_fd, short revents, struct relay_buf *b)
     return buf_write(out_fd, b);
 }
 
-int relay_bytes(int in_fd, int out_fd)
+/* 原来的单线程 poll 中继。 */
+static int relay_poll(int in_fd, int out_fd)
 {
     struct relay_buf b = {0};
     struct pollfd pfds[2];
@@ -122,4 +130,33 @@ int relay_bytes(int in_fd, int out_fd)
         if (out_idx >= 0 && handle_output(out_fd, pfds[out_idx].revents, &b) < 0)
             return -1;
     }
+}
+
+/* 丢进线程里跑的任务：做原来的 poll 中继。 */
+static void *relay_task(void *arg)
+{
+    struct relay_arg *a = arg;
+
+    a->status = relay_poll(a->in_fd, a->out_fd);
+    return NULL;
+}
+
+int relay_bytes(int in_fd, int out_fd)
+{
+    struct relay_arg arg;
+    pthread_t tid;
+
+    arg.in_fd = in_fd;
+    arg.out_fd = out_fd;
+    arg.status = -1;
+
+    if (pthread_create(&tid, NULL, relay_task, &arg) != 0) {
+        perror("pthread_create");
+        return -1;
+    }
+    if (pthread_join(tid, NULL) != 0) {
+        perror("pthread_join");
+        return -1;
+    }
+    return arg.status;
 }
