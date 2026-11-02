@@ -31,6 +31,13 @@ static void worker_finish(struct worker_arg *task, int task_status)
     task->task_status = task_status;
 }
 
+/* 读/写一步的结果；数值保持 1/0/-1，便于 while (step(...) > 0)。 */
+enum step_result {
+    STEP_FAILED = -1,
+    STEP_DONE = 0,
+    STEP_CONTINUE = 1
+};
+
 /* 把 buf 里 nbytes 全部写到 out_fd；短写则继续。成功 0，失败 -1。 */
 static int write_fully(int out_fd, const uint8_t *buf, size_t nbytes)
 {
@@ -57,16 +64,16 @@ static void reader_stop_gracefully(struct worker_arg *task)
 }
 
 /*
- * 读线程一步：1 继续；0 正常结束；-1 失败。
- * 本半步：只在「开读前 / read 被信号打断」时看停止标志。
+ * 读线程一步。本半步：只在「开读前 / read 被信号打断」时看停止标志。
  */
-static int reader_step(struct worker_arg *task, uint8_t *chunk, size_t chunk_cap)
+static enum step_result reader_step(struct worker_arg *task, uint8_t *chunk,
+                                    size_t chunk_cap)
 {
     ssize_t nread;
 
     if (stop_flag_is_set()) {
         reader_stop_gracefully(task);
-        return 0;
+        return STEP_DONE;
     }
 
     nread = read(task->endpoint_fd, chunk, chunk_cap);
@@ -75,46 +82,47 @@ static int reader_step(struct worker_arg *task, uint8_t *chunk, size_t chunk_cap
         if (errno == EINTR) {
             if (stop_flag_is_set()) {
                 reader_stop_gracefully(task);
-                return 0;
+                return STEP_DONE;
             }
-            return 1;
+            return STEP_CONTINUE;
         }
         perror("read");
         ringbuf_mark_error(task->shared_ring);
         worker_finish(task, -1);
-        return -1;
+        return STEP_FAILED;
     }
     if (nread == 0) {
         reader_stop_gracefully(task);
-        return 0;
+        return STEP_DONE;
     }
     if (ringbuf_push(task->shared_ring, chunk, (size_t)nread) < 0) {
         worker_finish(task, -1);
-        return -1;
+        return STEP_FAILED;
     }
-    return 1;
+    return STEP_CONTINUE;
 }
 
-/* 写线程一步：1 继续；0 正常结束；-1 失败。本半步尚不查停止标志。 */
-static int writer_step(struct worker_arg *task, uint8_t *chunk, size_t chunk_cap)
+/* 写线程一步。本半步尚不查停止标志。 */
+static enum step_result writer_step(struct worker_arg *task, uint8_t *chunk,
+                                    size_t chunk_cap)
 {
     ssize_t nbytes_from_ring = ringbuf_pop(task->shared_ring, chunk, chunk_cap);
 
     if (nbytes_from_ring < 0) {
         worker_finish(task, -1);
-        return -1;
+        return STEP_FAILED;
     }
     if (nbytes_from_ring == 0) {
         worker_finish(task, 0);
-        return 0;
+        return STEP_DONE;
     }
     if (write_fully(task->endpoint_fd, chunk, (size_t)nbytes_from_ring) < 0) {
         perror("write");
         ringbuf_mark_error(task->shared_ring);
         worker_finish(task, -1);
-        return -1;
+        return STEP_FAILED;
     }
-    return 1;
+    return STEP_CONTINUE;
 }
 
 static void *reader_task(void *arg)
