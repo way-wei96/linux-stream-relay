@@ -28,7 +28,7 @@ int main(int argc, char **argv)
     const char *out_path;
     int in_fd;
     int out_fd;
-    int status = 0;
+    int exit_status = 0;
 
     if (parse_args(argc, argv, &in_path, &out_path) < 0)
         return 1;
@@ -43,14 +43,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (set_nonblock(in_fd) < 0 || set_nonblock(out_fd) < 0) {
-        perror("fcntl");
-        status = 1;
-    } else if (relay_bytes(in_fd, out_fd) < 0) {
-        status = 1;
-    }
+    if (relay_bytes(in_fd, out_fd) < 0)
+        exit_status = 1;
 
     close_if_opened(in_fd, STDIN_FILENO);
     close_if_opened(out_fd, STDOUT_FILENO);
-    return status;
+    return exit_status;
 }

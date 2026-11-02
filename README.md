@@ -7,13 +7,13 @@
 ## 当前进度
 
 输入/输出都可以是标准流或文件；`-` 表示 stdin / stdout。
-中继仍是非阻塞 + `poll`（工作线程里跑）；`main` 负责 `create`/`join`。
-源码：`main.c`、`fdutil`、`poll_relay`（poll 中继）、`relay`（线程壳）。
+读线程 + 写线程 + 有界 ring buffer（`mutex`/`cond`）；两端阻塞 IO。
+源码：`main.c`、`fdutil`、`ringbuf`、`relay`。
 
 ## 编译
 
 ```text
-cc -Wall -Wextra -O0 -g -pthread -o relay src/main.c src/fdutil.c src/poll_relay.c src/relay.c
+cc -Wall -Wextra -O0 -g -pthread -o relay src/main.c src/fdutil.c src/ringbuf.c src/relay.c
 ```
 
 ## 运行示例

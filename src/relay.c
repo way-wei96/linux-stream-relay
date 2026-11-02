@@ -1,37 +1,178 @@
 #include "relay.h"
 
-#include "poll_relay.h"
+#include "ringbuf.h"
 
+#include <errno.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <unistd.h>
 
-struct relay_arg {
-    int in_fd;
-    int out_fd;
-    int status;
+/*
+ * 读、写线程共用：endpoint_fd 对读线程是 in_fd，对写线程是 out_fd。
+ */
+struct worker_arg {
+    int endpoint_fd;
+    struct ringbuf *shared_ring;
+    int task_status; /* 0 成功，-1 失败 */
 };
 
-static void *relay_task(void *arg)
+static void worker_arg_init(struct worker_arg *arg, int endpoint_fd,
+                            struct ringbuf *shared_ring)
 {
-    struct relay_arg *a = arg;
+    arg->endpoint_fd = endpoint_fd;
+    arg->shared_ring = shared_ring;
+    arg->task_status = -1;
+}
 
-    a->status = poll_relay(a->in_fd, a->out_fd, NULL, NULL);
+static void worker_finish(struct worker_arg *task, int task_status)
+{
+    task->task_status = task_status;
+}
+
+/* 把 buf 里 nbytes 全部写到 out_fd；短写则继续。成功 0，失败 -1。 */
+static int write_fully(int out_fd, const uint8_t *buf, size_t nbytes)
+{
+    size_t bytes_written = 0;
+
+    while (bytes_written < nbytes) {
+        ssize_t nwritten = write(out_fd, buf + bytes_written,
+                                 nbytes - bytes_written);
+
+        if (nwritten < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        bytes_written += (size_t)nwritten;
+    }
+    return 0;
+}
+
+/* 读线程一步：1 继续；0 正常结束；-1 失败（已写 task_status）。 */
+static int reader_step(struct worker_arg *task, uint8_t *chunk, size_t chunk_cap)
+{
+    ssize_t nread = read(task->endpoint_fd, chunk, chunk_cap);
+
+    if (nread < 0) {
+        if (errno == EINTR)
+            return 1;
+        perror("read");
+        ringbuf_mark_error(task->shared_ring);
+        worker_finish(task, -1);
+        return -1;
+    }
+    if (nread == 0) {
+        ringbuf_mark_producer_eof(task->shared_ring);
+        worker_finish(task, 0);
+        return 0;
+    }
+    if (ringbuf_push(task->shared_ring, chunk, (size_t)nread) < 0) {
+        worker_finish(task, -1);
+        return -1;
+    }
+    return 1;
+}
+
+/* 写线程一步：1 继续；0 正常结束；-1 失败（已写 task_status）。 */
+static int writer_step(struct worker_arg *task, uint8_t *chunk, size_t chunk_cap)
+{
+    ssize_t nbytes_from_ring = ringbuf_pop(task->shared_ring, chunk, chunk_cap);
+
+    if (nbytes_from_ring < 0) {
+        worker_finish(task, -1);
+        return -1;
+    }
+    if (nbytes_from_ring == 0) {
+        worker_finish(task, 0);
+        return 0;
+    }
+    if (write_fully(task->endpoint_fd, chunk, (size_t)nbytes_from_ring) < 0) {
+        perror("write");
+        ringbuf_mark_error(task->shared_ring);
+        worker_finish(task, -1);
+        return -1;
+    }
+    return 1;
+}
+
+static void *reader_task(void *arg)
+{
+    struct worker_arg *task = arg;
+    uint8_t chunk[1024];
+
+    while (reader_step(task, chunk, sizeof chunk) > 0) {
+    }
     return NULL;
+}
+
+static void *writer_task(void *arg)
+{
+    struct worker_arg *task = arg;
+    uint8_t chunk[1024];
+
+    while (writer_step(task, chunk, sizeof chunk) > 0) {
+    }
+    return NULL;
+}
+
+static int start_worker(pthread_t *tid, void *(*task)(void *),
+                        struct worker_arg *arg)
+{
+    if (pthread_create(tid, NULL, task, arg) != 0) {
+        perror("pthread_create");
+        return -1;
+    }
+    return 0;
+}
+
+static int both_workers_ok(int reader_started, int writer_started,
+                           const struct worker_arg *reader_arg,
+                           const struct worker_arg *writer_arg)
+{
+    return reader_started && writer_started &&
+           reader_arg->task_status == 0 && writer_arg->task_status == 0;
 }
 
 int relay_bytes(int in_fd, int out_fd)
 {
-    struct relay_arg arg;
-    pthread_t tid;
+    struct ringbuf shared_ring;
+    struct worker_arg reader_arg;
+    struct worker_arg writer_arg;
+    pthread_t reader_tid;
+    pthread_t writer_tid;
+    int reader_started = 0;
+    int writer_started = 0;
+    int relay_status = -1;
 
-    arg.in_fd = in_fd;
-    arg.out_fd = out_fd;
-    arg.status = -1;
-
-    if (pthread_create(&tid, NULL, relay_task, &arg) != 0) {
-        perror("pthread_create");
+    if (ringbuf_init(&shared_ring) < 0) {
+        perror("ringbuf_init");
         return -1;
     }
-    pthread_join(tid, NULL);
-    return arg.status;
+
+    worker_arg_init(&reader_arg, in_fd, &shared_ring);
+    worker_arg_init(&writer_arg, out_fd, &shared_ring);
+
+    if (start_worker(&reader_tid, reader_task, &reader_arg) < 0)
+        goto cleanup;
+    reader_started = 1;
+
+    if (start_worker(&writer_tid, writer_task, &writer_arg) < 0) {
+        ringbuf_mark_error(&shared_ring);
+        goto cleanup;
+    }
+    writer_started = 1;
+    goto cleanup;
+
+cleanup:
+    if (reader_started)
+        pthread_join(reader_tid, NULL);
+    if (writer_started)
+        pthread_join(writer_tid, NULL);
+
+    if (both_workers_ok(reader_started, writer_started, &reader_arg, &writer_arg))
+        relay_status = 0;
+
+    ringbuf_destroy(&shared_ring);
+    return relay_status;
 }
