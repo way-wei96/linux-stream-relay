@@ -1,6 +1,7 @@
 #include "relay.h"
 
 #include "ringbuf.h"
+#include "stop_flag.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -49,22 +50,42 @@ static int write_fully(int out_fd, const uint8_t *buf, size_t nbytes)
     return 0;
 }
 
-/* 读线程一步：1 继续；0 正常结束；-1 失败（已写 task_status）。 */
+static void reader_stop_gracefully(struct worker_arg *task)
+{
+    ringbuf_mark_producer_eof(task->shared_ring);
+    worker_finish(task, 0);
+}
+
+/*
+ * 读线程一步：1 继续；0 正常结束；-1 失败。
+ * 本半步：只在「开读前 / read 被信号打断」时看停止标志。
+ */
 static int reader_step(struct worker_arg *task, uint8_t *chunk, size_t chunk_cap)
 {
-    ssize_t nread = read(task->endpoint_fd, chunk, chunk_cap);
+    ssize_t nread;
+
+    if (stop_flag_is_set()) {
+        reader_stop_gracefully(task);
+        return 0;
+    }
+
+    nread = read(task->endpoint_fd, chunk, chunk_cap);
 
     if (nread < 0) {
-        if (errno == EINTR)
+        if (errno == EINTR) {
+            if (stop_flag_is_set()) {
+                reader_stop_gracefully(task);
+                return 0;
+            }
             return 1;
+        }
         perror("read");
         ringbuf_mark_error(task->shared_ring);
         worker_finish(task, -1);
         return -1;
     }
     if (nread == 0) {
-        ringbuf_mark_producer_eof(task->shared_ring);
-        worker_finish(task, 0);
+        reader_stop_gracefully(task);
         return 0;
     }
     if (ringbuf_push(task->shared_ring, chunk, (size_t)nread) < 0) {
@@ -74,7 +95,7 @@ static int reader_step(struct worker_arg *task, uint8_t *chunk, size_t chunk_cap
     return 1;
 }
 
-/* 写线程一步：1 继续；0 正常结束；-1 失败（已写 task_status）。 */
+/* 写线程一步：1 继续；0 正常结束；-1 失败。本半步尚不查停止标志。 */
 static int writer_step(struct worker_arg *task, uint8_t *chunk, size_t chunk_cap)
 {
     ssize_t nbytes_from_ring = ringbuf_pop(task->shared_ring, chunk, chunk_cap);

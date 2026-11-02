@@ -1,5 +1,6 @@
 #include "fdutil.h"
 #include "relay.h"
+#include "stop_flag.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -32,6 +33,8 @@ int main(int argc, char **argv)
 
     if (parse_args(argc, argv, &in_path, &out_path) < 0)
         return 1;
+
+    stop_flag_install_handlers();
 
     in_fd = open_input(in_path);
     if (in_fd < 0)
