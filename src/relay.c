@@ -96,6 +96,11 @@ static enum step_result reader_step(struct worker_arg *task, uint8_t *chunk,
         return STEP_DONE;
     }
     if (ringbuf_push(task->shared_ring, chunk, (size_t)nread) < 0) {
+        /* 等空位 timedwait 醒后看见停：按生产结束收工，叫醒写侧排空 */
+        if (stop_flag_is_set()) {
+            reader_stop_gracefully(task);
+            return STEP_DONE;
+        }
         worker_finish(task, -1);
         return STEP_FAILED;
     }

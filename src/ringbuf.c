@@ -1,6 +1,13 @@
 #include "ringbuf.h"
 
+#include "stop_flag.h"
+
+#include <errno.h>
 #include <string.h>
+#include <time.h>
+
+/* cond 等待超时：定期回到用户态，便于读侧看见停止旗。 */
+#define RINGBUF_WAIT_MS 100
 
 enum ring_copy_direction {
     RING_COPY_INTO, /* 外部 → 环（生产 / push） */
@@ -61,22 +68,52 @@ static void ring_copy(struct ringbuf *ring, void *external, size_t nbytes,
     }
 }
 
-/* 已持锁。等到有空位或出错。成功 0，失败 -1。 */
+static void deadline_after_ms(struct timespec *deadline, int wait_ms)
+{
+    clock_gettime(CLOCK_REALTIME, deadline);
+    deadline->tv_nsec += (long)wait_ms * 1000000L;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec += deadline->tv_nsec / 1000000000L;
+        deadline->tv_nsec %= 1000000000L;
+    }
+}
+
+/* 已持锁。timedwait；超时则回去重新判断条件。成功 0，出错/停止 -1。 */
 static int wait_for_space(struct ringbuf *ring)
 {
-    while (ring->byte_count == RINGBUF_CAP && !ring->has_error)
-        pthread_cond_wait(&ring->space_available, &ring->lock);
+    while (ring->byte_count == RINGBUF_CAP && !ring->has_error) {
+        struct timespec deadline;
+        int rc;
+
+        if (stop_flag_is_set())
+            return -1;
+
+        deadline_after_ms(&deadline, RINGBUF_WAIT_MS);
+        rc = pthread_cond_timedwait(&ring->space_available, &ring->lock,
+                                    &deadline);
+        if (rc != 0 && rc != ETIMEDOUT)
+            return -1;
+    }
     return ring->has_error ? -1 : 0;
 }
 
 /*
- * 已持锁。等到有数据、EOF 或出错。
+ * 已持锁。等到有数据、EOF 或出错（timedwait，超时后重判）。
  * 返回：1 有数据可取；0 EOF 且空；-1 失败。
+ * 写侧不因 stop_flag 在此退出：优雅停要继续排空环。
  */
 static int wait_for_data(struct ringbuf *ring)
 {
-    while (ring->byte_count == 0 && !ring->producer_eof && !ring->has_error)
-        pthread_cond_wait(&ring->data_available, &ring->lock);
+    while (ring->byte_count == 0 && !ring->producer_eof && !ring->has_error) {
+        struct timespec deadline;
+        int rc;
+
+        deadline_after_ms(&deadline, RINGBUF_WAIT_MS);
+        rc = pthread_cond_timedwait(&ring->data_available, &ring->lock,
+                                    &deadline);
+        if (rc != 0 && rc != ETIMEDOUT)
+            return -1;
+    }
     if (ring->has_error)
         return -1;
     if (ring->byte_count == 0 && ring->producer_eof)

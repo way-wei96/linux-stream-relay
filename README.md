@@ -10,7 +10,7 @@
 读线程 + 写线程 + 有界 ring buffer（`mutex`/`cond`）；两端阻塞 IO。
 信号半步：`stop_flag` 接 `SIGINT`（Ctrl+C），读侧看到后 `mark_producer_eof` 收工；
 写侧继续把环内剩余数据写完（优雅停不中断 `write`）。
-（堵在 `cond_wait` 上时下一刀再唤醒。）
+ring 等待用 `pthread_cond_timedwait`：读侧等空位时定期醒、可看见停。
 源码：`main.c`、`fdutil`、`ringbuf`、`relay`、`stop_flag`。
 
 ## 编译
