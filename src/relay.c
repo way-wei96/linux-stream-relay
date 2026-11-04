@@ -4,10 +4,14 @@
 #include "stop_flag.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
+
+/* 与 ring timedwait 同量级：定期回到用户态看停旗。 */
+#define READER_POLL_MS 100
 
 /*
  * 读、写线程共用：endpoint_fd 对读线程是 in_fd，对写线程是 out_fd。
@@ -64,16 +68,65 @@ static void reader_stop_gracefully(struct worker_arg *task)
 }
 
 /*
- * 读线程一步。本半步：只在「开读前 / read 被信号打断」时看停止标志。
+ * 带超时等 in_fd 可读（单 fd 的 poll）。
+ * 返回：1 可读（或对端挂起，可去 read）；0 该停；-1 失败。
+ */
+static int wait_input_readable(int in_fd)
+{
+    for (;;) {
+        struct pollfd pfd;
+        int rc;
+
+        if (stop_flag_is_set())
+            return 0;
+
+        pfd.fd = in_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        rc = poll(&pfd, 1, READER_POLL_MS);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                if (stop_flag_is_set())
+                    return 0;
+                continue;
+            }
+            return -1;
+        }
+        if (rc == 0)
+            continue;
+
+        if (pfd.revents & (POLLERR | POLLNVAL))
+            return -1;
+        if (pfd.revents & (POLLIN | POLLHUP))
+            return 1;
+    }
+}
+
+/*
+ * 读线程一步。先 poll 再 read：避免无 EINTR 时长期堵在阻塞 read 上看不见停。
  */
 static enum step_result reader_step(struct worker_arg *task, uint8_t *chunk,
                                     size_t chunk_cap)
 {
     ssize_t nread;
+    int wait_status;
 
     if (stop_flag_is_set()) {
         reader_stop_gracefully(task);
         return STEP_DONE;
+    }
+
+    wait_status = wait_input_readable(task->endpoint_fd);
+    if (wait_status == 0) {
+        reader_stop_gracefully(task);
+        return STEP_DONE;
+    }
+    if (wait_status < 0) {
+        perror("poll");
+        ringbuf_mark_error(task->shared_ring);
+        worker_finish(task, -1);
+        return STEP_FAILED;
     }
 
     nread = read(task->endpoint_fd, chunk, chunk_cap);

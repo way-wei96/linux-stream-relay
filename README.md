@@ -11,6 +11,7 @@
 信号半步：`stop_flag` 接 `SIGINT`（Ctrl+C），读侧看到后 `mark_producer_eof` 收工；
 写侧继续把环内剩余数据写完（优雅停不中断 `write`）。
 ring 等待用 `pthread_cond_timedwait`：读侧等空位时定期醒、可看见停。
+读侧 `read` 前用短超时 `poll` 等可读，避免长期堵在阻塞 `read` 上看不见停。
 源码：`main.c`、`fdutil`、`ringbuf`、`relay`、`stop_flag`。
 
 ## 编译
