@@ -102,7 +102,7 @@ static enum step_result reader_step(struct worker_arg *task, uint8_t *chunk,
     return STEP_CONTINUE;
 }
 
-/* 写线程一步。本半步尚不查停止标志。 */
+/* 写线程一步。优雅停不中断 write：环内数据要尽量写完。 */
 static enum step_result writer_step(struct worker_arg *task, uint8_t *chunk,
                                     size_t chunk_cap)
 {

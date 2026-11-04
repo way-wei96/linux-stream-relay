@@ -8,7 +8,8 @@
 
 输入/输出都可以是标准流或文件；`-` 表示 stdin / stdout。
 读线程 + 写线程 + 有界 ring buffer（`mutex`/`cond`）；两端阻塞 IO。
-信号半步：`stop_flag` 接 `SIGINT`（Ctrl+C），读侧看到后 `mark_producer_eof` 收工。
+信号半步：`stop_flag` 接 `SIGINT`（Ctrl+C），读侧看到后 `mark_producer_eof` 收工；
+写侧继续把环内剩余数据写完（优雅停不中断 `write`）。
 （堵在 `cond_wait` 上时下一刀再唤醒。）
 源码：`main.c`、`fdutil`、`ringbuf`、`relay`、`stop_flag`。
 
